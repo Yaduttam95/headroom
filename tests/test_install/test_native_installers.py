@@ -210,6 +210,19 @@ def _write_fake_docker_shims(tmp_path: Path) -> Path:
     openclaw_sh.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     openclaw_sh.chmod(0o755)
 
+    opencode_sh = shim_dir / "opencode"
+    opencode_sh.write_text(
+        "#!/usr/bin/env bash\n"
+        "{\n"
+        "  printf 'CONFIG=%s\\n' \"${OPENCODE_CONFIG_CONTENT-}\"\n"
+        "  printf 'ARGS='\n"
+        "  printf '%q ' \"$@\"\n"
+        "  printf '\\n'\n"
+        '} > "${FAKE_OPENCODE_LOG}"\n',
+        encoding="utf-8",
+    )
+    opencode_sh.chmod(0o755)
+
     openclaw_cmd = shim_dir / "openclaw.cmd"
     openclaw_cmd.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
 
@@ -556,6 +569,53 @@ def test_bash_native_installer_supports_persistent_docker_lifecycle(tmp_path: Pa
         _cleanup_fake_docker(env)
 
 
+@pytest.mark.skipif(
+    os.name == "nt" or shutil.which("bash") is None or not _bash_supports_4_3(),
+    reason="installer requires bash >= 4.3 (macOS system bash is 3.2)",
+)
+def test_bash_native_wrapper_supports_opencode(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".local").mkdir(parents=True)
+    env = _build_env(home, tmp_path)
+    env["HEADROOM_DOCKER_IMAGE"] = "headroom:test-image"
+    env["FAKE_OPENCODE_LOG"] = str(tmp_path / "opencode.log")
+
+    try:
+        _run(["bash", str(REPO_ROOT / "scripts" / "install.sh")], env=env, cwd=REPO_ROOT)
+        wrapper = home / ".local" / "bin" / "headroom"
+
+        config_file = home / ".config" / "opencode" / "opencode.json"
+        config_file.parent.mkdir(parents=True)
+        config_content = (
+            '{"provider":{"headroom":{"options":{"baseURL":"http://127.0.0.1:8787/v1"}}}}'
+        )
+        config_file.write_text(config_content, encoding="utf-8")
+
+        port = _free_port()
+        result = _run(
+            [str(wrapper), "wrap", "opencode", "--port", str(port), "--", "--help"],
+            env=env,
+        )
+        assert result.stderr == ""
+
+        docker_calls = _read_fake_docker_log(env)
+        prepare_call = next(
+            call
+            for call in docker_calls
+            if call[:2] == ["run", "--rm"] and "--prepare-only" in call and "opencode" in call
+        )
+        assert f"{home}/.config/opencode:/tmp/headroom-home/.config/opencode" in prepare_call
+        assert f"{home}/.config:/tmp/headroom-home/.config" not in prepare_call
+
+        opencode_output = Path(env["FAKE_OPENCODE_LOG"]).read_text(encoding="utf-8")
+        assert f"CONFIG={config_content}" in opencode_output
+        assert "ARGS=--help" in opencode_output
+        docker_state = json.loads(Path(env["FAKE_DOCKER_STATE"]).read_text(encoding="utf-8"))
+        assert docker_state["containers"] == {}
+    finally:
+        _cleanup_fake_docker(env)
+
+
 def _powershell_executable() -> str | None:
     return shutil.which("pwsh") or shutil.which("powershell") or shutil.which("powershell.exe")
 
@@ -645,6 +705,61 @@ def test_powershell_installer_does_not_leak_into_user_path(tmp_path: Path) -> No
         # that a failing test cannot leave the developer's PATH polluted.
         if _read_user_path_entry() != before:
             _restore_user_path_entry(before)
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
+def test_powershell_mcp_wrapper_keeps_stdin_attached_for_redirected_stdio(
+    tmp_path: Path,
+) -> None:
+    """Piped MCP stdio must still pass -i to Docker even when input is redirected."""
+    powershell = _powershell_executable()
+    assert powershell is not None
+
+    home = tmp_path / "home"
+    (home / ".local").mkdir(parents=True)
+    env = _build_env(home, tmp_path)
+    env["HEADROOM_DOCKER_IMAGE"] = "headroom:test-image"
+
+    try:
+        _run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(REPO_ROOT / "scripts" / "install.ps1"),
+            ],
+            env=env,
+            cwd=REPO_ROOT,
+        )
+        wrapper = home / ".local" / "bin" / "headroom.ps1"
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(wrapper),
+                "mcp",
+                "serve",
+            ],
+            env=env,
+            input='{"jsonrpc":"2.0","id":1,"method":"initialize"}\n',
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.returncode == 0
+        mcp_call = next(call for call in _read_fake_docker_log(env) if call[:2] == ["run", "--rm"])
+        assert "-i" in mcp_call
+        assert "-t" not in mcp_call
+    finally:
+        _cleanup_fake_docker(env)
 
 
 # AST-extract Ensure-PathEntry from install.ps1 and invoke it in isolation under
